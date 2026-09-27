@@ -777,15 +777,11 @@ class MiniPixV2:
             if full:
                 self.device_id = generate_device_id()
                 self.device_info = generate_device_info()
-                new_hdrs["x-device-id"] = self.device_id
             else:
                 if random.random() < 0.2:
                     self.device_id = generate_device_id()
                 if random.random() < 0.15:
                     self.device_info = generate_device_info()
-                new_hdrs["x-device-id"] = self.device_id
-        else:
-            new_hdrs["x-device-id"] = self.device_id
         try:
             self.session.headers.clear()
             self.session.headers.update(new_hdrs)
