@@ -777,11 +777,15 @@ class MiniPixV2:
             if full:
                 self.device_id = generate_device_id()
                 self.device_info = generate_device_info()
+                new_hdrs["x-device-id"] = self.device_id
             else:
                 if random.random() < 0.2:
                     self.device_id = generate_device_id()
                 if random.random() < 0.15:
                     self.device_info = generate_device_info()
+                new_hdrs["x-device-id"] = self.device_id
+        else:
+            new_hdrs["x-device-id"] = self.device_id
         try:
             self.session.headers.clear()
             self.session.headers.update(new_hdrs)
@@ -1948,7 +1952,64 @@ class MiniPixV2:
     ):
         if not (self.user_id and self.profile_id):
             return False
-        return True
+        try:
+            watched_pct = int(watched_pct or 0)
+        except Exception:
+            watched_pct = 0
+        ep_str = str(episode_no)
+        bodies = [
+            {
+                "series_id": series_id,
+                "episode_no": episode_no,
+                "episodeNo": episode_no,
+                "progress": watched_pct,
+                "watchedPct": watched_pct,
+                "campaign": False,
+                "task_type": "watch_ladder",
+            },
+            {
+                "type": "watch_ladder",
+                "seriesId": series_id,
+                "episode": ep_str,
+                "watched": watched_pct,
+                "campaign": False,
+            },
+            {
+                "task_id": f"watch_ladder_{series_id}",
+                "progress_delta": 1,
+                "series_id": series_id,
+                "episode_no": episode_no,
+                "campaign": False,
+            },
+        ]
+        endpoints = [
+            ("POST", "/coins/progress-report", bodies[0]),
+            ("POST", "/coins/tasks/progress", bodies[0]),
+            ("POST", f"/coins/tasks/watch_ladder_{series_id}/progress", bodies[0]),
+            ("POST", "/coins/watch-progress", bodies[1]),
+            ("POST", "/coins/report-watched", bodies[1]),
+            ("POST", "/coins/tasks/update", bodies[2]),
+            ("POST", "/watch-ladder/progress", bodies[0]),
+        ]
+        any_ok = False
+        for method, path, body in endpoints:
+            try:
+                sc, d = self._req(
+                    method,
+                    path,
+                    headers={"content-type": "application/json; charset=utf-8"},
+                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                )
+                if sc and sc < 500 and isinstance(d, dict):
+                    if d.get("success") is True:
+                        any_ok = True
+                        break
+                    if sc == 200 and "success" not in d:
+                        any_ok = True
+                        break
+            except Exception:
+                continue
+        return any_ok
 
     def _start_task_for_series(self, series_id):
         task_id = f"watch_ladder_{series_id}"
@@ -2973,6 +3034,7 @@ class MiniPixV2:
         }
         hdrs = {
             "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
         }
         if isinstance(extra_headers, dict):
             hdrs.update(extra_headers)
@@ -2993,6 +3055,7 @@ class MiniPixV2:
         payload = {"sessionId": session_id, "questionId": question_id}
         hdrs = {
             "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
         }
         if isinstance(extra_headers, dict):
             hdrs.update(extra_headers)
@@ -3014,6 +3077,7 @@ class MiniPixV2:
         payload = {"sessionId": session_id}
         hdrs = {
             "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
         }
         if isinstance(extra_headers, dict):
             hdrs.update(extra_headers)
