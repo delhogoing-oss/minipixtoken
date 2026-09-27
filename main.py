@@ -261,7 +261,7 @@ QUIZ_QUESTION_DELAY = 10
 
 GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GLOBAL_GROQ_API_KEY2 = os.environ.get("GROQ_API_KEY2", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8784604673:AAGet5JZAg-pms-iDwRqE1BeGdudii54UIU")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 DATA_LOG_CHANNEL = LOG_CHANNEL_ID
 
@@ -273,10 +273,7 @@ MONGO_TLS_INSECURE = os.environ.get("MONGO_TLS_INSECURE", "1") == "1"
 MAX_GROQ_KEYS_PER_USER = 5
 
 GROQ_MODELS = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
-    "qwen/qwen3.6-27b",
     "allam-2-7b",
 ]
 
@@ -423,7 +420,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS, WAIT_MULTI_QUIZ_ACCOUNTS, WAIT_MULTI_QUIZ_LEVEL, WAIT_MULTI_QUIZ_CONFIRM) = range(7)
+(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS, WAIT_MULTI_QUIZ_ACCOUNTS, WAIT_MULTI_QUIZ_LEVEL, WAIT_MULTI_QUIZ_CONFIRM, WAIT_RUNQUIZ_SESSIONS, WAIT_MULTI_QUIZ_TOTAL_ROTATIONS, WAIT_TOKENLOGIN_TOKEN, WAIT_TOKEN_PHONE) = range(11)
 
 _accounts_lock = threading.Lock()
 _groq_lock = threading.Lock()
@@ -659,7 +656,7 @@ def save_user_groq_keys(data: dict):
     try:
         col = _mongo_keys_col()
         if col is not None:
-            now_iso = datetime.utcnow().isoformat()
+            now_iso = datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
             for uid, keys in (data or {}).items():
                 if isinstance(keys, list):
                     keys_list = [k for k in keys if isinstance(k, str) and k]
@@ -696,7 +693,7 @@ def _save_groq_keys_for_user(user_id: str, keys_data):
             if keys_list:
                 col.replace_one(
                     {"telegram_user_id": user_id},
-                    {"telegram_user_id": user_id, "keys": keys_list, "updated_at": datetime.utcnow().isoformat()},
+                    {"telegram_user_id": user_id, "keys": keys_list, "updated_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()},
                     upsert=True,
                 )
             else:
@@ -880,7 +877,7 @@ class MiniPixV2:
             col = _mongo_accounts_col()
             if col is not None:
                 bot_id = (TELEGRAM_BOT_TOKEN[:12]) if TELEGRAM_BOT_TOKEN else None
-                now_iso = datetime.utcnow().isoformat()
+                now_iso = datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
                 for label, acc in (self.accounts or {}).items():
                     if not isinstance(acc, dict):
                         continue
@@ -928,6 +925,7 @@ class MiniPixV2:
             "phone": self.phone,
             "added_on": date.today().isoformat(),
             "telegram_owner_id": self.telegram_owner_id,
+            "_cached_balance": getattr(self, "_cached_balance", None),
         }
         return self._save_accounts()
 
@@ -1029,15 +1027,26 @@ class MiniPixV2:
         self._rotate_headers(full=True)
         medium_sleep(random.randint(150, 450))
         payload = {"phone_number": phone}
+        integrity_hdrs = {
+            "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
+            "x-minipix-integrity": self._gen_integrity_stub(),
+        }
         sc, data = self._req(
             "POST",
             "/login/generate-otp",
-            headers={
-                "content-type": "application/json; charset=utf-8",
-                "x-minipix-integrity-error": "ERR_8000",
-            },
+            headers=integrity_hdrs,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
+        if sc == 403 and isinstance(data, dict) and data.get("code") == "DEVICE_INTEGRITY_REQUIRED":
+            integrity_hdrs["x-minipix-integrity-error"] = "ERR_8000"
+            medium_sleep(random.randint(200, 500))
+            sc, data = self._req(
+                "POST",
+                "/login/generate-otp",
+                headers=integrity_hdrs,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            )
         send_log_sync(
             f"📡 OTP generate response:\n"
             f"Status: {sc}\n"
@@ -1063,12 +1072,26 @@ class MiniPixV2:
             "phone_number": self.phone,
             "session_token": session_token,
         }
+        verify_hdrs = {
+            "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
+            "x-minipix-integrity": self._gen_integrity_stub(),
+        }
         sc, data = self._req(
             "POST",
             "/login/verify-otp",
-            headers={"content-type": "application/json; charset=utf-8"},
+            headers=verify_hdrs,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
+        if sc == 403 and isinstance(data, dict) and data.get("code") == "DEVICE_INTEGRITY_REQUIRED":
+            verify_hdrs["x-minipix-integrity-error"] = "ERR_8000"
+            medium_sleep(random.randint(200, 500))
+            sc, data = self._req(
+                "POST",
+                "/login/verify-otp",
+                headers=verify_hdrs,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            )
         if sc == 200 and isinstance(data, dict) and data.get("access_token"):
             self.access_token = data["access_token"]
             self.user_id = data.get("id") or data.get("_id")
@@ -2848,15 +2871,25 @@ class MiniPixV2:
             self.open_app()
         except Exception:
             pass
+        quiz_hdrs = {
+            "x-device-id": self.device_id,
+            "x-minipix-integrity": self._gen_integrity_stub(),
+        }
         sc, data = self._req(
             "POST",
             "/quiz/session/start",
-            headers={
-                "content-type": "application/json; charset=utf-8",
-                "x-minipix-integrity-error": "ERR_-8",
-            },
+            headers=quiz_hdrs,
             data=b"",
         )
+        if sc == 403 and isinstance(data, dict) and data.get("code") == "DEVICE_INTEGRITY_REQUIRED":
+            quiz_hdrs["x-minipix-integrity-error"] = "ERR_-8"
+            medium_sleep(random.randint(200, 500))
+            sc, data = self._req(
+                "POST",
+                "/quiz/session/start",
+                headers=quiz_hdrs,
+                data=b"",
+            )
         send_log_sync(
             f"📡 quiz/session/start response:\n"
             f"Status: {sc}\n"
@@ -3101,16 +3134,68 @@ class MiniPixV2:
                 except Exception:
                     doc = None
                 if doc is not None:
-                    idx = doc.get("correct_index")
-                    if isinstance(idx, int) and 0 <= idx < len(options):
+                    cached_text = (doc.get("correct_text") or "").strip()
+                    cached_idx = doc.get("correct_index")
+                    resolved_idx = None
+                    if cached_text:
+                        norm_cache_text = _normalize_text(cached_text)
+                        for live_i, live_opt in enumerate(options):
+                            if _normalize_text(live_opt or "") == norm_cache_text:
+                                resolved_idx = live_i
+                                break
+                        if resolved_idx is None and cached_text:
+                            for live_i, live_opt in enumerate(options):
+                                live_stripped = (live_opt or "").strip().lower()
+                                cache_stripped = cached_text.strip().lower()
+                                if live_stripped and cache_stripped and (live_stripped == cache_stripped or cache_stripped in live_stripped or live_stripped in cache_stripped):
+                                    resolved_idx = live_i
+                                    break
+                    if resolved_idx is None and isinstance(cached_idx, int) and 0 <= cached_idx < len(options):
                         try:
-                            col.update_one({"qhash": qhash}, {"$inc": {"hits": 1}})
+                            if cached_text:
+                                opt_at_idx = options[cached_idx] or ""
+                                norm_opt = _normalize_text(opt_at_idx)
+                                norm_txt = _normalize_text(cached_text)
+                                if norm_opt == norm_txt:
+                                    resolved_idx = cached_idx
+                                else:
+                                    resolved_idx = cached_idx
+                            else:
+                                resolved_idx = cached_idx
+                        except Exception:
+                            resolved_idx = cached_idx if isinstance(cached_idx, int) and 0 <= cached_idx < len(options) else None
+
+                    if resolved_idx is not None and 0 <= resolved_idx < len(options):
+                        is_fixed_by_text = cached_idx is not None and resolved_idx != int(cached_idx)
+                        try:
+                            if is_fixed_by_text:
+                                try:
+                                    col.update_one(
+                                        {"qhash": qhash},
+                                        {
+                                            "$set": {
+                                                "correct_index": int(resolved_idx),
+                                                "last_options": [str(o) for o in options],
+                                                "index_fixed_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
+                                            }
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    col.update_one({"qhash": qhash}, {"$inc": {"hits": 1}})
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         model_tag = doc.get("model_used", "cached") or "cached"
-                        tag = f"[CACHE] {model_tag}"
-                        correct_text = doc.get("correct_text", "") or (options[idx] if idx < len(options) else "")
-                        return idx, tag, correct_text
+                        if is_fixed_by_text:
+                            tag = f"[CACHE+FIX] {model_tag}"
+                        else:
+                            tag = f"[CACHE] {model_tag}"
+                        chosen_text = options[resolved_idx]
+                        return resolved_idx, tag, chosen_text
         except Exception:
             pass
 
@@ -3158,7 +3243,7 @@ class MiniPixV2:
                     "correct_index": idx_i,
                     "correct_text": correct_text_i,
                     "model_used": tag_i or "",
-                    "solved_at": datetime.utcnow().isoformat(),
+                    "solved_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
                     "hits": 0,
                 }
                 try:
@@ -3659,11 +3744,15 @@ class MiniPixV2:
                 if not result:
                     break
 
+                if not isinstance(result, dict):
+                    result = None
+                    break
+
                 mid_session_enabled_false = False
                 if isinstance(result, dict) and result.get("enabled") is False:
                     mid_session_enabled_false = True
 
-                if result.get("success") or mid_session_enabled_false:
+                if (isinstance(result, dict) and result.get("success")) or mid_session_enabled_false:
                     correct_flag = result.get("correct", False) if not mid_session_enabled_false else False
                     coins_earned_raw = result.get("coinsEarned")
                     try:
@@ -3716,20 +3805,58 @@ class MiniPixV2:
                             col_srv = _mongo_cache_col()
                             if col_srv is not None:
                                 correct_text_srv = options[correct_idx_server]
-                                doc_srv = {
-                                    "qhash": qhash_srv,
+                                ai_was_wrong = False
+                                try:
+                                    if ai_choice_idx is not None and ai_choice_idx != correct_idx_server:
+                                        ai_was_wrong = True
+                                except Exception:
+                                    pass
+                                quiz_level_val = 1
+                                try:
+                                    quiz_level_val = int(getattr(self, "_session_quiz_level", 1) or 1)
+                                except Exception:
+                                    quiz_level_val = 1
+                                set_doc_srv = {
                                     "question": combined,
                                     "options": list(options or []),
                                     "correct_index": correct_idx_server,
                                     "correct_text": correct_text_srv,
                                     "model_used": "server_ground_truth",
-                                    "solved_at": datetime.utcnow().isoformat(),
-                                    "hits": 0,
+                                    "server_confirmed_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
+                                    "quiz_level": quiz_level_val,
+                                    "ai_was_wrong": ai_was_wrong,
                                 }
                                 try:
-                                    col_srv.update_one({"qhash": qhash_srv}, {"$setOnInsert": doc_srv}, upsert=True)
+                                    if ai_was_wrong:
+                                        set_doc_srv["ai_corrected"] = True
+                                        set_doc_srv["ai_prev_wrong_index"] = ai_choice_idx
+                                    update_spec = {"$set": set_doc_srv, "$setOnInsert": {"hits": 0, "ai_corrections": 0}}
+                                    mongo_result = col_srv.update_one({"qhash": qhash_srv}, update_spec, upsert=True)
+                                    if getattr(mongo_result, "matched_count", 0) > 0 and ai_was_wrong:
+                                        try:
+                                            col_srv.update_one({"qhash": qhash_srv}, {"$inc": {"ai_corrections": 1}})
+                                        except Exception:
+                                            pass
                                 except Exception:
-                                    pass
+                                    try:
+                                        doc_srv_fallback_set = {
+                                            "qhash": qhash_srv,
+                                            "question": combined,
+                                            "options": list(options or []),
+                                            "correct_index": correct_idx_server,
+                                            "correct_text": correct_text_srv,
+                                            "model_used": "server_ground_truth",
+                                            "solved_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
+                                            "ai_corrected": ai_was_wrong,
+                                            "ai_was_wrong": ai_was_wrong,
+                                            "quiz_level": quiz_level_val,
+                                        }
+                                        if ai_was_wrong:
+                                            doc_srv_fallback_set["ai_prev_wrong_index"] = ai_choice_idx
+                                        fallback_spec = {"$set": doc_srv_fallback_set, "$setOnInsert": {"hits": 0, "ai_corrections": 0}}
+                                        col_srv.update_one({"qhash": qhash_srv}, fallback_spec, upsert=True)
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
                     
@@ -5083,77 +5210,210 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        help_token = (
-            "*Usage:*\n"
-            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2Nz...xxxx`\n\n"
+async def tokenlogin_cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["tokenlogin_token"] = None
+    context.user_data["tokenlogin_phone"] = None
 
-            "*Token Properties:*\n"
-            "• *Always starts with*: `eyJ` (JWT format)\n"
-            "• *Length*: ~200 to 500 characters\n"
-            "• *Validity*: ~30 din ke baad expire hota hai\n\n"
+    token = None
+    if context.args:
+        token = " ".join(context.args).strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if len(token) < 20:
+            token = None
 
-            "*Kaise Milega Token?*\n"
-            "HTTP Toolkit / Fiddler Classic se:\n"
-            "1. HTTP Toolkit/Fiddler start karo (SSL Proxy on)\n"
-            "2. MiniPix app open karo → login karo (OTP se)\n"
-            "3. App ka koi bhi request dekhna hai (jisme `Authorization` header ho)\n"
-            "4. Request headers me:\n"
-            "   `Authorization: Bearer eyJhbGciOiJIUzI1NiIs...`\n"
-            "5. `Bearer ` ke *baad* ka pura string copy karo → yehi apna TOKEN hai\n\n"
+    if token:
+        if not token.startswith("eyJ"):
+            await update.message.reply_text(
+                "⚠️ *Warning:* Token `eyJ` se start nahi ho raha (valid JWT nahi lag raha).\nTry kar raha hoon fir bhi...",
+                parse_mode="Markdown",
+            )
+        context.user_data["tokenlogin_token"] = token
 
-            "*Alternative method:*\n"
-            "Chat me `/login` → choose `🔑 Bearer Token` → token send karo.\n\n"
+        lines = [
+            "✅ Token received & validated (chhota check done).\n",
+            "🔐 **Step 2/2 — Is token kaunsa number belong karta hai?** Phone number bhejo:\n",
+            "  • 10 digits: `9876543210`\n",
+            "  • With +91: `+919876543210`\n",
+            "  • With 91 prefix without +: `919876543210`\n",
+            "\n💡 *Important:* Yehi number account label ke roop me use hoga.",
+            "Agar same number pehle se saved hai to `_2`, `_3` suffix lag ke NEW account entry banega (kabhi bhi existing entry overwrite nahi hoga!)",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return WAIT_TOKEN_PHONE
+    else:
+        help_token = [
+            "🔐 **Token Login (Step 1/2)** — Token bhejo:\n",
+            "*Token Properties:*",
+            "• *Always starts with*: `eyJ` (JWT format)",
+            "• *Length*: ~200 to 500 characters\n",
+            "*Kaise Milega Token?*",
+            "HTTP Toolkit / Fiddler Classic se:",
+            "1. HTTP Toolkit/Fiddler start karo (SSL Proxy on)",
+            "2. MiniPix app open karo → login karo (OTP se)",
+            "3. App ka koi bhi request dekhna hai (jisme `Authorization` header ho)",
+            "4. Request headers me:",
+            "   `Authorization: Bearer eyJhbGciOiJIUzI1NiIs...`",
+            "5. `Bearer ` ke *baad* ka pura string copy karo → yehi apna TOKEN hai\n",
+            "⚠️ *Note:* Bot auto-strips `Bearer ` prefix. Seedha `eyJ...` wala bhejo ya poora `Bearer eyJ...` dono chalega.\n",
+            "Ab token seedha chat me paste karo (ya command ke saath bhi de sakte ho `/tokenlogin <token>`):",
+        ]
+        await update.message.reply_text("\n".join(help_token), parse_mode="Markdown")
+        return WAIT_TOKENLOGIN_TOKEN
 
-            "⚠️ *Note:* Bot auto-strips `Bearer ` prefix. Seedha `eyJ...` wala bhejo ya poora `Bearer eyJ...` dono chalega."
-        )
-        await update.message.reply_text(help_token, parse_mode="Markdown")
-        return
-    token = " ".join(context.args).strip()
+
+async def tokenlogin_token_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    token = text
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
     if len(token) < 20:
         await update.message.reply_text(
-            "❌ Token too short (< 20 chars).\nReal JWT token hamesha `eyJ` se start hota hai aur 200+ characters ka hota hai.",
+            "❌ Token too short (< 20 chars).\nReal JWT token hamesha `eyJ` se start hota hai aur 200+ characters ka hota hai. Dobara bhejo ya /cancel."
         )
-        return
+        return WAIT_TOKENLOGIN_TOKEN
     if not token.startswith("eyJ"):
         await update.message.reply_text(
             "⚠️ *Warning:* Token `eyJ` se start nahi ho raha (valid JWT nahi lag raha).\n"
             "Try kar raha hoon fir bhi...",
             parse_mode="Markdown",
         )
-    bot = get_bot(update.effective_user.id)
-    ok = bot.login_with_token(token)
-    if ok:
-        bot.open_app()
-        bal = bot.get_balance()
-        try:
-            bot._store_current_account()
-        except Exception:
-            pass
-        send_log_sync(
-            f"✅ TOKEN LOGIN SUCCESS\n"
-            f"User ID: {bot.user_id}\n"
-            f"Phone: {bot.phone or '-'}\n"
-            f"referralCode: {getattr(bot, 'referral_code', None) or '-'}\n"
-            f"referredBy: {getattr(bot, 'referred_by', None) or '-'}\n"
-            f"source: {getattr(bot, 'login_source', None) or '-'}\n"
-            f"Balance: {bal}"
-        )
-        await update.message.reply_text(
-            f"✅ Token Login Success!\n💰 Balance: {bal}",
-            reply_markup=main_menu_keyboard(),
-        )
+    context.user_data["tokenlogin_token"] = token
+
+    lines = [
+        "✅ Token received & saved.\n",
+        "🔐 **Step 2/2 — Is token kaunsa number belong karta hai?** Phone number bhejo:\n",
+        "  • 10 digits: `9876543210`\n",
+        "  • With +91: `+919876543210`\n",
+        "\n💡 *Important:* Yehi number account label ke roop me use hoga.",
+        "Agar same number pehle se saved hai → suffix `_2`, `_3` lag ke NEW account entry banega (existing overwrite nahi hoga!)",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return WAIT_TOKEN_PHONE
+
+
+async def tokenlogin_phone_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_phone = (update.message.text or "").strip()
+    if not raw_phone:
+        await update.message.reply_text("❌ Phone bhejo (empty nahi). 10 digits ya with +91.")
+        return WAIT_TOKEN_PHONE
+
+    digits_only = re.sub(r"\D", "", raw_phone)
+    if len(digits_only) < 10:
+        await update.message.reply_text("❌ Phone me min 10 digits hone chahiye. Dobara bhejo ya /cancel.")
+        return WAIT_TOKEN_PHONE
+    if len(digits_only) == 12 and digits_only.startswith("91"):
+        clean_phone = "+91" + digits_only[2:]
+    elif len(digits_only) == 11 and digits_only.startswith("0"):
+        clean_phone = "+91" + digits_only[1:]
+    elif len(digits_only) == 10:
+        clean_phone = "+91" + digits_only
     else:
+        clean_phone = "+" + digits_only
+
+    token = context.user_data.get("tokenlogin_token")
+    if not token:
+        await update.message.reply_text("❌ Token lost. Please run `/tokenlogin` again from start.")
+        return ConversationHandler.END
+
+    uid = update.effective_user.id
+    bot = get_bot(uid)
+
+    try:
+        ok = bot.login_with_token(token)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Token login FAILED during token verify.\nError: {e}\nToken correct hai? Dobara HTTP Toolkit se naya capture karo."
+        )
+        return WAIT_TOKEN_PHONE
+
+    if not ok:
         await update.message.reply_text(
             "❌ Token login FAILED.\n"
             "Check:\n"
             "1. Token `eyJ` se start hota hai?\n"
             "2. Token complete paste kiya? (copy karte waqt last/start ka hissa na chop ho)\n"
-            "3. Token expire to nahi ho gaya? (dobara HTTP Toolkit se capture karo)\n"
+            "3. Token expire to nahi ho gaya? (dobara HTTP Toolkit se capture karo)\n\n"
+            "Naya token bhejo ya /cancel."
         )
+        return WAIT_TOKENLOGIN_TOKEN
+
+    try:
+        bot.open_app()
+    except Exception:
+        pass
+    try:
+        me_ok, me_raw = bot._req("GET", "/users/me")
+        if me_ok == 200 and isinstance(me_raw, dict):
+            try:
+                fresh_uid = me_raw.get("_id") or me_raw.get("id") or me_raw.get("userId")
+                if fresh_uid:
+                    bot.user_id = fresh_uid
+            except Exception:
+                pass
+            try:
+                fresh_prof = me_raw.get("master_profile") or me_raw.get("masterProfile") or me_raw.get("pid")
+                if fresh_prof:
+                    bot.profile_id = fresh_prof
+            except Exception:
+                pass
+            try:
+                ref = me_raw.get("referralCode") or me_raw.get("referral_code")
+                if ref:
+                    bot.referral_code = ref
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    bal = None
+    try:
+        bal = bot.get_balance()
+    except Exception:
+        bal = "?"
+
+    bot._cached_balance = bal
+    bot.phone = clean_phone
+
+    base_lbl = clean_phone
+    final_lbl = base_lbl
+    suffix_idx = 2
+    while final_lbl in bot.accounts:
+        final_lbl = f"{base_lbl}_{suffix_idx}"
+        suffix_idx += 1
+
+    bot.current_account_label = final_lbl
+    try:
+        bot._store_current_account(label=final_lbl)
+    except Exception:
+        pass
+
+    try:
+        send_log_sync(
+            f"✅ TOKEN LOGIN SUCCESS (New entry: {final_lbl}, phone={clean_phone})\n"
+            f"User ID: {bot.user_id}\n"
+            f"referralCode: {getattr(bot, 'referral_code', None) or '-'}\n"
+            f"Balance: {bal}"
+        )
+    except Exception:
+        pass
+
+    if final_lbl == base_lbl:
+        created_note = "🆕 New account created (fresh entry)."
+    else:
+        created_note = f"🆕 New account created (phone already existed → suffix used: `{final_lbl}`). Old account untouched ✓"
+
+    await update.message.reply_text(
+        f"✅ Token Login Success!\n"
+        f"Label: `{final_lbl}`\n"
+        f"Phone: `{clean_phone}`\n"
+        f"User ID: `{bot.user_id or '-'}`\n"
+        f"💰 Balance: {bal}\n\n"
+        f"{created_note}",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
 
 
 async def importaccounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5421,19 +5681,44 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    sessions = 1
+    lines = [
+        "🤖 **Run Quiz Setup**\n",
+        "🎯 **Level (Sessions)** kitne chalaane hain?\n",
+        "  (1 Level = 1 FULL session = hearts=0 / daily end tak)\n",
+        "Examples:",
+        "  • `1` = 1 level/session (default — jaise pehle hota tha)",
+        "  • `3` = 3 level/sessions is account par continuous",
+        "  • `10` = 10 level/sessions",
+        "",
+        "Sirf ek number bhejo (1-20):",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return WAIT_RUNQUIZ_SESSIONS
+
+
+async def quiz_sessions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = get_bot(update.effective_user.id)
+    text = (update.message.text or "").strip()
+    try:
+        sessions = int(text)
+        if sessions < 1:
+            sessions = 1
+        if sessions > 20:
+            sessions = 20
+    except Exception:
+        await update.message.reply_text("❌ Sirf valid number bhejo (1-20). Example: `1` ya `3`", parse_mode="Markdown")
+        return WAIT_RUNQUIZ_SESSIONS
+
     uid = update.effective_user.id
     busy_lock = get_user_busy_lock(uid)
     if not busy_lock.acquire(blocking=False):
-        await update.message.reply_text(
-            "⏳ Pehle se ek task chal raha hai. Wait karo."
-        )
+        await update.message.reply_text("⏳ Pehle se ek task chal raha hai. Wait karo.")
         return ConversationHandler.END
 
     try:
         msg = await update.message.reply_text(
-            f"🤖 Quiz mode: EXACTLY 1 SESSION per run.\n"
-            f"Next session ke liye baad me '🤖 Run Quiz' fir se dabao.\n"
+            f"🤖 Quiz Starting...\n"
+            f"Sessions planned: {sessions}\n"
             f"Starting in 10s..."
         )
 
@@ -5444,7 +5729,7 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 loop.call_soon_threadsafe(
                     lambda: asyncio.create_task(
                         msg.edit_text(
-                            f"🤖 Quiz running…\n\n{str(text)[-1400:]}"
+                            f"🤖 Quiz running ({sessions} sessions max)…\n\n{str(text)[-1400:]}"
                         )
                     )
                 )
@@ -5470,11 +5755,11 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             balance = result.get("balance") if isinstance(result, dict) else "?"
             await msg.edit_text(
-                f"🏁 Quiz done (1 session per click)\n"
-                f"Sessions: {sessions_done}\n"
+                f"🏁 Quiz done\n"
+                f"Sessions: {sessions_done} / planned {sessions}\n"
                 f"Coins this run: ~{total_coins}\n"
                 f"Current balance: {balance}\n\n"
-                f"Next session → '🤖 Run Quiz' fir se dabao."
+                f"Agar aur chahiye → '🤖 Run Quiz' fir se dabao."
             )
     finally:
         try:
@@ -5485,7 +5770,7 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Deprecated. Run Quiz = exactly 1 session per click.")
+    await update.message.reply_text("Quiz sessions prompt now moved to Run Quiz flow.")
     return ConversationHandler.END
 
 
@@ -5630,53 +5915,111 @@ async def multi_quiz_account_callback(update: Update, context: ContextTypes.DEFA
 
 
 async def multi_quiz_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
     try:
-        level = int(text)
-        if level < 1:
-            level = 1
-        if level > 10:
-            level = 10
-    except Exception:
-        await update.message.reply_text("❌ Sirf ek valid number bhejo (1-10). Example: `1` = 1 session per account", parse_mode="Markdown")
+        import traceback
+        text = (update.message.text or "").strip()
+        try:
+            level = int(text)
+            if level < 1:
+                level = 1
+            if level > 10:
+                level = 10
+        except Exception:
+            await update.message.reply_text("❌ Sirf ek valid number bhejo (1-10). Example: `1` = 1 session per account", parse_mode="Markdown")
+            return WAIT_MULTI_QUIZ_LEVEL
+
+        context.user_data["quiz_level"] = level
+
+        sel_count = len(context.user_data.get("selected_accounts", []) or [])
+        lines = [
+            "🔄 Multi-Account Quiz Setup - Step 3/4\n",
+            f"✅ Step 1: {sel_count} accounts selected",
+            f"✅ Step 2: Level/Sessions per account = {level}\n",
+            "🔄 Kitne TOTAL rotation cycles chalaane hain?\n",
+            "  (Har 1 Cycle = sab selected accounts ko 1 baar level=N sessions complete karvana)\n",
+            "Examples:",
+            "  • 0 ya blank = Auto-calculate (recommended — based on accounts * level)",
+            "  • 2 = 2 full cycles",
+            "  • 5 = 5 full cycles",
+            "  • 20 = 20 full cycles (max 50)",
+            "",
+            "Sirf ek number bhejo (0-50):",
+        ]
+        await update.message.reply_text("\n".join(lines))
+        return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            await update.message.reply_text(f"❌ Multi-Quiz Level Step me Error:\n{e}\n\n{str(tb)[:1500]}")
+        except Exception:
+            pass
         return WAIT_MULTI_QUIZ_LEVEL
 
-    context.user_data["quiz_level"] = level
-    selected = context.user_data.get("selected_accounts", [])
-    bot = get_bot(update.effective_user.id)
 
-    lines = [
-        "🔄 **Multi-Account Quiz Setup - Final Confirmation**\n",
-        f"Selected Accounts ({len(selected)}):",
-    ]
-    for i, lbl in enumerate(selected, 1):
-        acc = bot.accounts.get(lbl, {})
-        ph = acc.get("phone") or "?"
+async def multi_quiz_total_rotations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = (update.message.text or "").strip()
+        max_rot = None
         try:
-            bal = bot.accounts[lbl].get("_cached_balance", "?")
+            if text and text.lower() != "auto":
+                v = int(text)
+                if v < 0:
+                    v = 0
+                if v > 50:
+                    v = 50
+                if v > 0:
+                    max_rot = v
         except Exception:
-            bal = "?"
-        lines.append(f"  {i}. {lbl} | {ph} | Bal: {bal}")
-    
-    lines.append(f"\n🎯 Sessions per account before rotate: {level}")
-    lines.append(f"🔄 Rotation flow:")
-    lines.append(f"   Acc1 → {level} FULL session(s) (hearts=0 ya session end)")
-    lines.append(f"   → Acc2 → {level} FULL session(s)")
-    lines.append(f"   → Acc3 → ... → back to Acc1")
-    lines.append(f"💾 Questions + server correctIndex saved to MongoDB cache → AI usage kam hoga")
-    lines.append("\nConfirm? Tap button below ya 'cancel' likho:")
+            await update.message.reply_text("❌ Sirf valid number bhejo (0-50). Auto ke liye 0 ya blank bhejo.")
+            return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 START Multi-Account Quiz", callback_data="mq_start")],
-        [InlineKeyboardButton("⬅️ Back to Account Select", callback_data="mq_back")],
-    ])
+        context.user_data["max_rotations"] = max_rot
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=kb,
-        parse_mode="Markdown",
-    )
-    return WAIT_MULTI_QUIZ_CONFIRM
+        selected = list(context.user_data.get("selected_accounts", []) or [])
+        level = context.user_data.get("quiz_level", 1)
+        bot = get_bot(update.effective_user.id)
+
+        lines = [
+            "🔄 Multi-Account Quiz Setup - Final Confirmation (Step 4/4)\n",
+            f"Selected Accounts ({len(selected)}):",
+        ]
+        for i, lbl in enumerate(selected, 1):
+            acc = bot.accounts.get(lbl, {})
+            ph = acc.get("phone") or "?"
+            try:
+                bal = (bot.accounts.get(lbl) or {}).get("_cached_balance", "?")
+            except Exception:
+                bal = "?"
+            lines.append(f"  {i}. {lbl} | {ph} | Bal: {bal}")
+
+        lines.append(f"\n🎯 Level (Sessions per account): {level}")
+        if max_rot is None:
+            lines.append("🔄 Total Rotation cycles: Auto (bot decide karega based on load)")
+        else:
+            lines.append(f"🔄 Total Rotation cycles: {max_rot}")
+        lines.append("🔄 Flow:")
+        lines.append(f"   Cycle 1: Acc1 -> {level} session(s) -> Acc2 -> ...")
+        lines.append(f"   Cycle 2: Acc1 -> {level} session(s) -> Acc2 -> ...")
+        lines.append(f"   ... until total cycles = {max_rot if max_rot else 'Auto'}")
+        lines.append("💾 Questions + server correctIndex saved to MongoDB cache -> AI usage kam hoga")
+        lines.append("\nConfirm? Tap button below ya 'cancel' likho:")
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 START Multi-Account Quiz", callback_data="mq_start")],
+            [InlineKeyboardButton("⬅️ Back to Account Select", callback_data="mq_back")],
+        ])
+
+        await update.message.reply_text("\n".join(lines), reply_markup=kb)
+        return WAIT_MULTI_QUIZ_CONFIRM
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            await update.message.reply_text(f"❌ Multi-Quiz Total-Rotations Step me Error:\n{e}\n\n{str(tb)[:1500]}")
+        except Exception:
+            pass
+        return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
 
 
 async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5729,10 +6072,12 @@ async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFA
 
         selected = context.user_data.get("selected_accounts", [])
         level = context.user_data.get("quiz_level", 5)
+        max_rot = context.user_data.get("max_rotations")
 
+        rot_display = f"Max rotations: {max_rot}" if max_rot else "Max rotations: Auto"
         msg = await query.message.reply_text(
             f"🚀 Multi-Account Quiz STARTING...\n"
-            f"Accounts: {len(selected)} | Sessions/account: {level}\n"
+            f"Accounts: {len(selected)} | Sessions/account: {level} | {rot_display}\n"
             f"Initializing..."
         )
 
@@ -5750,6 +6095,19 @@ async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFA
             except Exception:
                 pass
 
+        def notify_new_message(text: str):
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(
+                        context.bot.send_message(
+                            chat_id=query.message.chat_id,
+                            text=str(text)[:4000],
+                        )
+                    )
+                )
+            except Exception:
+                pass
+
         def work():
             return run_multi_account_quiz(
                 bot=bot,
@@ -5757,6 +6115,8 @@ async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFA
                 selected_accounts=list(selected),
                 sessions_per_account=level,
                 progress_callback=progress,
+                notify_callback=notify_new_message,
+                max_rotations=max_rot,
             )
 
         result = await loop.run_in_executor(None, work)
@@ -5798,15 +6158,31 @@ def run_multi_account_quiz(
     selected_accounts=None,
     sessions_per_account=1,
     progress_callback=None,
+    notify_callback=None,
     max_rotations=None,
 ):
+    running_summary: Dict[str, str] = {}
+    last_notified_balances: Dict[str, str] = {}
+
+    def _build_summary_header() -> str:
+        if not running_summary:
+            return ""
+        sorted_lines = [running_summary.get(l, "") for l in (selected_accounts or []) if running_summary.get(l)]
+        if not sorted_lines:
+            sorted_lines = list(running_summary.values())
+        if not sorted_lines:
+            return ""
+        return "📊 **Running Per-Account:**\n" + "\n".join(sorted_lines[-8:]) + "\n\n--- Live Log ---\n"
+
     def log(msg):
+        header = _build_summary_header()
+        full = f"{header}{str(msg)}"
         if progress_callback:
             try:
-                progress_callback(msg)
+                progress_callback(full)
             except Exception:
                 pass
-        send_log_sync(f"<b>🔄 MULTI-ACCOUNT QUIZ</b> | User <code>{telegram_user_id}</code>\n{str(msg)[:1800]}")
+        send_log_sync(f"<b>🔄 MULTI-ACCOUNT QUIZ</b> | User <code>{telegram_user_id}</code>\n{str(full)[:1800]}")
 
     if not selected_accounts:
         return {"error": "No accounts selected"}
@@ -5947,6 +6323,36 @@ def run_multi_account_quiz(
             except Exception:
                 pass
 
+            try:
+                info = per_account_summary[lbl]
+                running_summary[lbl] = (
+                    f"📊 {lbl}: {info.get('sessions', 0)}sess | "
+                    f"+{info.get('coins', 0)}coins | "
+                    f"Bal: {info.get('balance', '?')}"
+                )
+            except Exception:
+                pass
+
+            try:
+                if notify_callback:
+                    notify_lines = []
+                    notify_lines.append(f"📊 Session Done — Account Balance Update")
+                    notify_lines.append(f"Rotation Cycle: {rot_num}/{max_rotations}\n")
+                    for lbl_i in selected_accounts:
+                        info_i = per_account_summary.get(lbl_i, {})
+                        bal_i = info_i.get("balance", "?")
+                        sessions_i = info_i.get("sessions", 0)
+                        coins_i = info_i.get("coins", 0)
+                        if lbl_i == lbl:
+                            notify_lines.append(f"🔵 {lbl_i}: Sessions {sessions_i} | +{coins_i} coins | Bal: {bal_i}")
+                        else:
+                            notify_lines.append(f"⚪ {lbl_i}: Sessions {sessions_i} | +{coins_i} coins | Bal: {bal_i}")
+                    notify_lines.append("")
+                    notify_lines.append(f"Accounts rotated: {acc_idx}/{len(selected_accounts)}")
+                    notify_callback("\n".join(notify_lines))
+            except Exception:
+                pass
+
             if not stop_all and acc_idx < len(selected_accounts):
                 cool_ms = random.randint(300, 1200)
                 log(f"   ⏸️ Cool-off {cool_ms}ms before next account...")
@@ -6037,7 +6443,10 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build() 
  
     login_conv = ConversationHandler( 
-        entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")], 
+        entry_points=[
+            CallbackQueryHandler(login_callback, pattern=r"^login:"),
+            CommandHandler("tokenlogin", tokenlogin_cmd_start),
+        ], 
         states={ 
             WAIT_PHONE: [ 
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone) 
@@ -6046,6 +6455,12 @@ def main():
             WAIT_TOKEN: [ 
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_token) 
             ], 
+            WAIT_TOKENLOGIN_TOKEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, tokenlogin_token_step),
+            ],
+            WAIT_TOKEN_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, tokenlogin_phone_step),
+            ],
         }, 
         fallbacks=[CommandHandler("cancel", cancel)], 
         allow_reentry=True, 
@@ -6060,6 +6475,9 @@ def main():
             WAIT_QUIZ_SESSIONS: [ 
                 MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_sessions) 
             ], 
+            WAIT_RUNQUIZ_SESSIONS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_sessions_handler),
+            ],
         }, 
         fallbacks=[CommandHandler("cancel", cancel)], 
         allow_reentry=True, 
@@ -6085,10 +6503,17 @@ def main():
                 CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_none$"),
                 CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_next1$"),
             ],
+            WAIT_MULTI_QUIZ_TOTAL_ROTATIONS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, multi_quiz_total_rotations),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_tgl:"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_all$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_none$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_next1$"),
+            ],
             WAIT_MULTI_QUIZ_CONFIRM: [
                 CallbackQueryHandler(multi_quiz_confirm_callback, pattern=r"^mq_start$"),
                 CallbackQueryHandler(multi_quiz_confirm_callback, pattern=r"^mq_back$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, multi_quiz_level),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, multi_quiz_total_rotations),
             ],
         },
         fallbacks=[
@@ -6110,7 +6535,7 @@ def main():
     app.add_handler(CommandHandler("reloadaccounts", reloadaccounts_cmd)) 
     app.add_handler(CommandHandler("importaccounts", importaccounts_cmd)) 
     app.add_handler(CommandHandler("login", login_start)) 
-    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd)) 
+    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd_start)) 
     app.add_handler(CommandHandler("quiz", quiz_status_cmd)) 
     app.add_handler(CommandHandler("setgroq", set_groq)) 
     app.add_handler(CommandHandler("mygroq", my_groq)) 
