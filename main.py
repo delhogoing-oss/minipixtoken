@@ -44,19 +44,20 @@ try:
         Application,
         CommandHandler,
         MessageHandler,
+        CallbackQueryHandler,
         ConversationHandler,
         ContextTypes,
         filters,
     )
 except Exception as _err:
     sys.stdout.write(f"❌ python-telegram-bot missing: {_err}\n")
-    sys.stdout.write("   → pip install python-telegram-bot==21.11\n")
+    sys.stdout.write("    → pip install python-telegram-bot==21.11\n")
     sys.exit(1)
 
 # ───────────────────────── CONFIG ─────────────────────────
 API_BASE      = "https://api.minipix.co/v4"
 BOT_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-STATE_GC_SEC  = 10 * 60              # Auto-clean user state after 10 min
+STATE_GC_SEC  = 10 * 60               # Auto-clean user state after 10 min
 
 # Conversation states
 WAIT_PHONE, WAIT_OTP = range(2)
@@ -73,7 +74,7 @@ _DEVICE_BRANDS = [
     "Infinix", "Tecno", "iQOO", "Nothing", "Google Pixel",
 ]
 _DEVICE_MODELS = {
-    "Xiaomi":       ["Redmi Note 12","Redmi Note 11","Redmi Note 10","Mi 11 Lite","Redmi 12","Poco X5","Poco M6 Pro","Redmi Note 13"],
+    "Xiaomi":        ["Redmi Note 12","Redmi Note 11","Redmi Note 10","Mi 11 Lite","Redmi 12","Poco X5","Poco M6 Pro","Redmi Note 13"],
     "Xiaomi Redmi": ["Redmi Note 12 Pro","Redmi Note 11S","Redmi 10 Prime","Redmi A2 Plus","Redmi 12C"],
     "Xiaomi Poco":  ["Poco X5 Pro","Poco F5","Poco M6 Pro","Poco C65","Poco X6 Neo"],
     "Samsung":      ["Galaxy M34","Galaxy M14","Galaxy A14","Galaxy A24","Galaxy A34","Galaxy S21 FE","Galaxy F34"],
@@ -337,7 +338,7 @@ class MiniPixClient:
         jwt = decode_jwt_payload(self.access_token)
         if isinstance(jwt, dict):
             if jwt.get("nonce"):
-                self.device_id     = str(jwt["nonce"])
+                self.device_id      = str(jwt["nonce"])
                 self.device_frozen = True
             if not self.user_id:
                 self.user_id = (jwt.get("id") or jwt.get("userId") or jwt.get("user_id")
@@ -520,9 +521,9 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return WAIT_PHONE
 
     _set_state_field(uid, stage="otp",
-                     session_token=session_tok,
-                     phone=phone,
-                     otp_attempts=0)
+                       session_token=session_tok,
+                       phone=phone,
+                       otp_attempts=0)
     _log(f"[user:{uid}] otp generated → ok")
     txt = (f"✅ OTP send ho gaya! Registered mobile `{phone}` par check karein.\n\n"
            f"*Step 2/2 — Enter 6-digit OTP:*")
@@ -668,10 +669,10 @@ def main():
     if not BOT_TOKEN:
         sys.stdout.write(
             "❌ TELEGRAM_BOT_TOKEN env var nahi mila.\n"
-            "   Set karein & run:\n"
-            "     Windows: set TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
-            "     Linux:   export TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
-            "     python token_bot.py\n"
+            "    Set karein & run:\n"
+            "      Windows: set TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
+            "      Linux:   export TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
+            "      python token_bot.py\n"
         )
         sys.exit(2)
 
