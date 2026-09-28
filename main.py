@@ -443,26 +443,26 @@ def _keyboard_cancel():
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     txt = (
-        f"👋 Namaste *{u.first_name}*!\n\n"
-        f"🎮 Yeh *MiniPix Token Extractor Bot* hai.\n"
+        f"👋 Namaste {u.first_name}!\n\n"
+        f"🎮 Yeh MiniPix Token Extractor Bot hai.\n"
         f"Koi bhi user OTP login karke apna poora token data\n"
         f"JSON file me download kar sakta hai.\n\n"
-        f"✅ *Steps:*\n"
+        f"✅ Steps:\n"
         f"  1. Send /login\n"
         f"  2. Apna phone number daalein (+91... ya 10-digit)\n"
         f"  3. OTP aayega → OTP daalein\n"
         f"  4. Verify ho jayega → JSON file bhej di jayegi\n\n"
-        f"📁 *JSON file me kya hoga:*\n"
+        f"📁 JSON file me kya hoga:\n"
         f"  • Bearer Access Token\n"
         f"  • Refresh Token\n"
         f"  • Quiz Session Tokens\n"
         f"  • user_id, profile_id, phone\n"
         f"  • device_id (JWT nonce)\n"
         f"  • JWT payload decoded\n\n"
-        f"⚠️  Security: Tokens apne paas hi rakhein — kisi se mat share karein.\n"
+        f"⚠️ Security: Tokens apne paas hi rakhein — kisi se mat share karein.\n"
         f"/login se shuru karein — /cancel se cancel."
     )
-    await update.message.reply_markdown(txt, reply_markup=_keyboard_cancel())
+    await update.message.reply_text(txt, reply_markup=_keyboard_cancel())
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
@@ -479,11 +479,11 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     _set_state_field(uid, client=MiniPixClient(), stage="phone")
-    txt = ("📱 *Step 1/2 — Phone Number*\n\n"
+    txt = ("📱 Step 1/2 — Phone Number\n\n"
            "Apna MiniPix registered mobile number daalein:\n"
-           "  • 10-digit (India): `98XXXXXX11`\n"
-           "  • Full format:      `+9198XXXXXX11`")
-    await update.message.reply_markdown(txt, reply_markup=_keyboard_cancel())
+           "  • 10-digit (India): 98XXXXXX11\n"
+           "  • Full format:      +9198XXXXXX11")
+    await update.message.reply_text(txt, reply_markup=_keyboard_cancel())
     return WAIT_PHONE
 
 async def _send_generic_err(update: Update, text: str):
@@ -509,15 +509,12 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return WAIT_PHONE
 
     _log(f"[user:{uid}] generate_otp → phone={phone}")
-    await update.message.reply_text(
-        f"📡 Generating OTP for `{phone}`...",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(f"📡 Generating OTP for {phone}...")
     session_tok, err = client.generate_otp(phone)
     if session_tok is None:
-        txt = (f"❌ OTP Generate FAIL:\n`{err or 'Unknown'}`\n\n"
+        txt = (f"❌ OTP Generate FAIL:\n{err or 'Unknown'}\n\n"
                f"/cancel karein ya phir naya number daalein.")
-        await update.message.reply_markdown(txt, reply_markup=_keyboard_cancel())
+        await update.message.reply_text(txt, reply_markup=_keyboard_cancel())
         return WAIT_PHONE
 
     _set_state_field(uid, stage="otp",
@@ -525,9 +522,9 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                        phone=phone,
                        otp_attempts=0)
     _log(f"[user:{uid}] otp generated → ok")
-    txt = (f"✅ OTP send ho gaya! Registered mobile `{phone}` par check karein.\n\n"
-           f"*Step 2/2 — Enter 6-digit OTP:*")
-    await update.message.reply_markdown(txt, reply_markup=_keyboard_cancel())
+    txt = (f"✅ OTP send ho gaya! Registered mobile {phone} par check karein.\n\n"
+           f"Step 2/2 — Enter 6-digit OTP:")
+    await update.message.reply_text(txt, reply_markup=_keyboard_cancel())
     return WAIT_OTP
 
 async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -559,15 +556,14 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if not ok:
         _set_state_field(uid, otp_attempts=attempts)
         if attempts < 3:
-            txt = (f"❌ OTP Verify FAIL:\n`{err or 'Unknown'}`\n\n"
+            txt = (f"❌ OTP Verify FAIL:\n{err or 'Unknown'}\n\n"
                    f"Phir se 6-digit OTP daalein (attempt {attempts}/3):")
-            await sent.edit_text(txt, reply_markup=_keyboard_cancel(),
-                                 parse_mode=None)
+            await sent.edit_text(txt, reply_markup=_keyboard_cancel())
             return WAIT_OTP
-        txt = (f"❌ 3 baar galat OTP. Flow cancel.\n`{err}`\n\n"
+        txt = (f"❌ 3 baar galat OTP. Flow cancel.\n{err}\n\n"
                f"/login se naya session shuru karein.")
         try:
-            await sent.edit_text(txt, reply_markup=None, parse_mode=None)
+            await sent.edit_text(txt, reply_markup=None)
         except Exception:
             await update.message.reply_text(txt)
         _gc_state(uid)
@@ -584,15 +580,15 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     caption = (
         f"✅ TOKEN EXTRACT HO GAYA!\n\n"
         f"👤 Telegram: @{tg_user.username or f'{tg_user.id}'}\n"
-        f"📱 Phone     : `{dump['phone']}`\n"
-        f"🪪 user_id   : `{dump['user_id'] or '?'}`\n"
-        f"🧭 profile_id: `{dump['profile_id'] or '?'}`\n"
-        f"📱 device_id : `{dump['device_id']}`\n"
-        f"🔗 nonce_bind: {'✅ YES (frozen)' if dump['device_bound_via_nonce'] else '❌ No'}\n"
-        f"🔐 Access Tkn: `{str(dump['tokens']['access_token'])[:40]}…`\n"
-        f"🔄 Refresh   : {'✅ present' if dump['tokens']['refresh_token'] else '—'}\n"
+        f"📱 Phone     : {dump['phone']}\n"
+        f"🪪 user_id   : {dump['user_id'] or '?'}\n"
+        f"🧭 profile_id: {dump['profile_id'] or '?'}\n"
+        f"📱 device_id : {dump['device_id']}\n"
+        f"🔗 nonce_bind: {'YES (frozen)' if dump['device_bound_via_nonce'] else 'No'}\n"
+        f"🔐 Access Tkn: {str(dump['tokens']['access_token'])[:40]}…\n"
+        f"🔄 Refresh   : {'present' if dump['tokens']['refresh_token'] else '—'}\n"
         f"🧠 Quiz Tkns : {len(dump['tokens']['quiz_tokens']) if isinstance(dump['tokens']['quiz_tokens'], list) else ('✅' if dump['tokens']['quiz_tokens'] else '—')}\n\n"
-        f"⚠️  *Security:* Ye file delete ya apne paas hi rakhein.\n"
+        f"⚠️ Security: Ye file delete ya apne paas hi rakhein.\n"
         f"   Yahi Token AffiliateGuru panel / MiniPix bot me use karo."
     )
     try:
@@ -600,17 +596,16 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             chat_id=update.effective_chat.id,
             document=InputFile(bio, filename=fname),
             caption=caption,
-            parse_mode="Markdown",
         )
     except Exception as e:
-        err_txt = (f"⚠️  File send failed ({e}). Yaha text me data hai:\n\n"
+        err_txt = (f"⚠️ File send failed ({e}). Yaha text me data hai:\n\n"
                    f"```json\n"
                    f"{json.dumps(dump, indent=2, ensure_ascii=False)[:3500]}\n"
                    f"```")
         try:
             await sent.edit_text(err_txt, parse_mode="Markdown")
         except Exception:
-            await update.message.reply_text(err_txt, parse_mode="Markdown")
+            await update.message.reply_text(err_txt)
     else:
         try:
             await sent.delete()
@@ -658,6 +653,7 @@ def build_application(token: str):
         ],
         allow_reentry=True,
         conversation_timeout=600,
+        per_message=True,
     )
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(cancel_callback, pattern=r"^bot_cancel$"))
