@@ -29,6 +29,7 @@ import uuid
 import hashlib
 import base64
 import threading
+import argparse
 from datetime import date, datetime
 from typing import Dict, Any, Optional
 
@@ -37,6 +38,13 @@ try:
 except ImportError:
     sys.stdout.write("❌ 'requests' missing → pip install requests python-telegram-bot\n")
     sys.exit(1)
+
+try:
+    from curl_cffi import requests as curl_requests  # type: ignore
+    HAS_CURL_CFFI = True
+except Exception:
+    HAS_CURL_CFFI = False
+    curl_requests = None
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -63,11 +71,16 @@ STATE_GC_SEC  = 10 * 60              # Auto-clean user state after 10 min
 WAIT_PHONE, WAIT_OTP = range(2)
 
 # ───────────────────────── DEVICE CONSTANTS ───────────────
-_OKHTTP_VERSIONS = [
-    "okhttp/4.11.0", "okhttp/4.12.0", "okhttp/4.10.0",
-    "okhttp/4.9.3",  "okhttp/4.9.2",  "okhttp/4.8.1", "okhttp/4.7.2",
-]
-_APP_VERSIONS  = ["332"]
+# ⚠️ CAPTURE-GROUNDED VALUES — THESE ARE NOT RANDOM!
+# From 103 captures (mixpix_API_capture_data.txt L226 / L211-214):
+#   x-app-version = 328   in ALL 103 captures (STATIC)
+#   user-agent    = okhttp/4.12.0   in ALL 94 logged occurrences
+#   accept-encoding = gzip
+_APP_VERSION      = "328"
+_UA_OKHTTP        = "okhttp/4.12.0"
+_ACCEPT_ENCODING  = "gzip"
+
+# Only used in POST body (device_id/device_info) — NOT in pre-login headers!
 _DEVICE_BRANDS = [
     "Xiaomi", "Xiaomi Redmi", "Xiaomi Poco", "Samsung", "OnePlus",
     "Realme", "OPPO", "Vivo", "Motorola", "Nokia",
@@ -125,13 +138,26 @@ def _set_state_field(uid: int, **fields):
         _user_state[uid].update(fields)
 
 # ───────────────────────── HELPERS ────────────────────────
-def _log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    sys.stdout.write(f"[{ts}] {msg}\n")
+def _p(msg: str = ""):
     try:
+        sys.stdout.write(str(msg) + "\n")
         sys.stdout.flush()
     except Exception:
-        pass
+        try:
+            sys.stdout.buffer.write((str(msg) + "\n").encode("utf-8", errors="replace"))
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
+
+def _log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    _p(f"[{ts}] {msg}")
+
+def _print_section(title: str):
+    bar = "=" * 70
+    _p(f"\n{bar}")
+    _p(f"  {title}")
+    _p(bar)
 
 def _rand_hex(n):
     return "".join(random.choices("0123456789abcdef", k=n))
@@ -160,10 +186,13 @@ def generate_device_info():
     ])
 
 def generate_headers():
+    """Session-level BASE headers — matches capture 1:1.
+    NO x-device-id / NO x-minipix-integrity here — those are per-call only
+    on integrity-gated endpoints (OTP, quiz, attest)."""
     return {
-        "user-agent":      random.choice(_OKHTTP_VERSIONS),
-        "accept-encoding": "gzip",
-        "x-app-version":   random.choice(_APP_VERSIONS),
+        "user-agent":      _UA_OKHTTP,
+        "accept-encoding": _ACCEPT_ENCODING,
+        "x-app-version":   _APP_VERSION,
     }
 
 def _jitter(base_ms, amount=0.5, min_ms=5):
@@ -212,8 +241,20 @@ def normalize_phone(raw: str) -> str:
 
 # ───────────────────────── MINIPIX API CLIENT ─────────────
 class MiniPixClient:
-    def __init__(self):
-        self.session       = requests.Session()
+    def __init__(self, verbose: bool = False, use_curl_cffi: Optional[bool] = None):
+        self.verbose       = verbose
+        self._last_req_log = None
+        # curl_cffi = better TLS/JA3 fingerprint (bypasses WAF blocks on python-requests)
+        if use_curl_cffi is None:
+            self.use_curl = HAS_CURL_CFFI
+        else:
+            self.use_curl = bool(use_curl_cffi and HAS_CURL_CFFI)
+        if self.use_curl:
+            self.session = curl_requests.Session(impersonate="chrome124")
+            # For android-app-like JA3: impersonate="chrome120" on Android or "chrome124"
+        else:
+            self.session = requests.Session()
+        # Device state
         self.device_id     = generate_device_id()
         self.device_info   = generate_device_info()
         self.phone         = None
@@ -224,6 +265,14 @@ class MiniPixClient:
         self.profile_id    = None
         self.device_frozen = False
         self._reset_headers()
+        if self.verbose:
+            tls = "curl_cffi(JA3=chrome124)" if self.use_curl else "python-requests(standard)"
+            _p(f"[INIT] HTTP engine  = {tls}")
+            _p(f"[INIT] device_id    = {self.device_id}")
+            _p(f"[INIT] device_info  = {self.device_info}")
+            _p(f"[INIT] session hdrs = {dict(self.session.headers)}")
+            if not self.use_curl and HAS_CURL_CFFI is False:
+                _p("[INIT] 💡 Tip: pip install curl_cffi → better TLS JA3 bypass for AWS WAF 403")
 
     def _reset_headers(self):
         for k in list(self.session.headers.keys()):
@@ -240,9 +289,30 @@ class MiniPixClient:
     def _req(self, method, path, **kw):
         kw.setdefault("timeout", 15)
         url = f"{API_BASE}{path}"
+        extra_hdrs = kw.get("headers") or {}
+        data = kw.get("data")
+        if self.verbose:
+            _p()
+            _p(f"─── REQUEST ──────────────────────────────────────────")
+            _p(f"  METHOD : {method}")
+            _p(f"  URL    : {url}")
+            merged_hdrs = dict(self.session.headers)
+            merged_hdrs.update(extra_hdrs)
+            _p(f"  HEADERS: {json.dumps(merged_hdrs, indent=2, ensure_ascii=False)}")
+            if data is not None:
+                if isinstance(data, (bytes, bytearray)):
+                    try:
+                        _p(f"  BODY   : {data.decode('utf-8', errors='replace')}")
+                    except Exception:
+                        _p(f"  BODY   : <{len(data)} bytes>")
+                else:
+                    _p(f"  BODY   : {data!r}")
+            _p(f"──────────────────────────────────────────────────────")
         try:
             r = self.session.request(method, url, **kw)
         except Exception as e:
+            if self.verbose:
+                _p(f"  ❌ EXCEPTION: {e!r}")
             return 0, str(e)
         ct = r.headers.get("content-type", "")
         try:
@@ -256,41 +326,141 @@ class MiniPixClient:
                     data = t
         except Exception:
             data = r.text[:1000]
+        if self.verbose:
+            _p(f"─── RESPONSE ─────────────────────────────────────────")
+            _p(f"  STATUS : {r.status_code}")
+            resp_hdrs = dict(r.headers)
+            _print_keys = ["content-type", "www-authenticate", "x-request-id",
+                           "x-ratelimit-remaining", "x-error-code"]
+            shown = {k: resp_hdrs[k] for k in _print_keys if k in resp_hdrs}
+            if shown:
+                _p(f"  HEADERS: {json.dumps(shown, indent=2, ensure_ascii=False)}")
+            if isinstance(data, dict):
+                _p(f"  BODY   : {json.dumps(data, indent=2, ensure_ascii=False)}")
+            else:
+                s = str(data)
+                if len(s) > 1500:
+                    s = s[:1500] + "… [TRUNCATED]"
+                _p(f"  BODY   : {s}")
+            if r.status_code == 403:
+                _p(f"  ⚠️  403 FORBIDDEN — Device integrity / auth issue")
+            _p(f"──────────────────────────────────────────────────────")
+        self._last_req_log = {"status": r.status_code, "data": data}
         return r.status_code, data
+
+    def _login_header_strategies(self, include_integrity=False):
+        """Generator of header permutations for login endpoints (gen-otp / verify-otp).
+        Ordered: capture-grounded minimal FIRST (most likely to pass WAF), then
+        progressively add headers if 403/empty.
+        Capture #103 (gen-otp) & #102 (verify-otp) had NO x-device-id, NO x-minipix-integrity,
+        NO x-client-id — just 5 base headers. So strategy #1 = exactly that."""
+        base_ct = "application/json; charset=utf-8"
+        # ---- Strategy 1: EXACT capture headers (NO extras) — BEST CHANCE ----
+        s1 = {
+            "content-type": base_ct,
+            # NOTE: no x-device-id, no x-minipix-integrity, no x-client-id here!
+        }
+        yield ("CAPTURE_MINIMAL_v1", s1)
+        # ---- Strategy 2: same but include device_id header (x-device-id) ----
+        s2 = dict(s1)
+        s2["x-device-id"] = self.device_id
+        yield ("ADD_X_DEVICE_ID_v2", s2)
+        # ---- Strategy 3: + integrity stub (old behaviour) ----
+        s3 = dict(s2)
+        if include_integrity:
+            s3["x-minipix-integrity"] = self._integrity_stub()
+        yield ("ADD_INTEGRITY_STUB_v3", s3)
+        # ---- Strategy 4: + integrity-error: ERR_8000 (pre-emptive) ----
+        s4 = dict(s3)
+        if include_integrity:
+            s4["x-minipix-integrity-error"] = "ERR_8000"
+        yield ("PRE_EMPTIVE_ERR_8000_v4", s4)
+        # ---- Strategy 5: add x-client-id: android ----
+        s5 = dict(s4)
+        s5["x-client-id"] = "android"
+        yield ("ADD_X_CLIENT_ANDROID_v5", s5)
+        # ---- Strategy 6: try newer app version (might be geo/version dependent) ----
+        s6 = dict(s5)
+        s6["x-app-version"] = "332"
+        s6["user-agent"]   = "okhttp/4.12.0"
+        yield ("APP_VERSION_332_v6", s6)
+        # ---- Strategy 7: ERR_4000 variant (from device_register.py original) ----
+        s7 = dict(s5)
+        if include_integrity:
+            s7["x-minipix-integrity-error"] = "ERR_4000"
+        s7["x-client-id"] = "minipix_quiz"
+        s7["x-app-version"] = "3"
+        yield ("MINIPIX_QUIZ_ERR4000_v7", s7)
 
     def generate_otp(self, phone):
         self.phone = phone
         self.device_id   = generate_device_id()
         self.device_info = generate_device_info()
         self._reset_headers()
+        if self.verbose:
+            _p(f"\n[GEN-OTP] New device generated for phone={phone}")
+            _p(f"[GEN-OTP] device_id={self.device_id}  device_info={self.device_info}")
         _slp(random.randint(150, 450))
 
         payload = {"phone_number": phone}
-        hdrs = {
-            "content-type":        "application/json; charset=utf-8",
-            "x-device-id":         self.device_id,
-            "x-minipix-integrity": self._integrity_stub(),
-        }
-        sc, d = self._req(
-            "POST", "/login/generate-otp",
-            headers=hdrs,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        if sc == 403 and isinstance(d, dict) and d.get("code") == "DEVICE_INTEGRITY_REQUIRED":
-            hdrs["x-minipix-integrity-error"] = "ERR_8000"
-            _slp(random.randint(200, 500))
+        last_err = None
+        last_sc = 0
+
+        for idx, (label, hdrs) in enumerate(self._login_header_strategies(include_integrity=True), 1):
+            if self.verbose:
+                _p(f"\n▶️  [ATTEMPT {idx}/7] generate-otp strategy → {label}")
+                merged = dict(self.session.headers)
+                merged.update(hdrs)
+                _p(f"   headers = {json.dumps(merged, indent=2, ensure_ascii=False)}")
+            _slp(random.randint(200, 600))
+
             sc, d = self._req(
                 "POST", "/login/generate-otp",
                 headers=hdrs,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             )
-        if sc == 200 and isinstance(d, dict):
-            ok = d.get("message") == "OTP sent" or d.get("success")
-            if ok:
-                return d.get("session_token") or d.get("sessionToken"), None
-            msg = d.get("message") or d.get("error") or "Unknown error"
-            return None, f"{msg} | {json.dumps(d, ensure_ascii=False)[:400]}"
-        return None, f"HTTP {sc}: {str(d)[:300]}"
+            last_sc = sc
+            last_err = d
+
+            if sc == 403 and isinstance(d, dict) and d.get("code") == "DEVICE_INTEGRITY_REQUIRED":
+                if self.verbose:
+                    _p(f"\n🔁 [FALLBACK] 403 DEVICE_INTEGRITY_REQUIRED → adding ERR_8000, retrying same strategy once")
+                hdrs_retry = dict(hdrs)
+                hdrs_retry["x-minipix-integrity-error"] = "ERR_8000"
+                _slp(random.randint(200, 500))
+                sc, d = self._req(
+                    "POST", "/login/generate-otp",
+                    headers=hdrs_retry,
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                )
+                last_sc = sc
+                last_err = d
+
+            # Success check
+            if sc == 200 and isinstance(d, dict):
+                ok = d.get("message") == "OTP sent" or d.get("success")
+                if ok:
+                    if self.verbose:
+                        _p(f"\n✅ [GEN-OTP OK] Strategy '{label}' WORKED on attempt {idx}!")
+                    return d.get("session_token") or d.get("sessionToken"), None
+                msg = d.get("message") or d.get("error") or "Unknown error"
+                last_err = f"{msg} | {json.dumps(d, ensure_ascii=False)[:400]}"
+
+            # Non-403 terminal-ish status — stop wasting retries? (400 = bad phone, 429 = rate limit)
+            if sc in (400, 422) and isinstance(d, dict):
+                if self.verbose:
+                    _p(f"   ⏹️  Stopping retries — {sc} is client-input error (not WAF/integrity)")
+                break
+            if sc == 429:
+                if self.verbose:
+                    _p(f"   ⏹️  Stopping retries — 429 RATE LIMIT hit")
+                break
+
+        # ---- All attempts failed ----
+        if isinstance(last_err, dict):
+            msg = last_err.get("message") or last_err.get("error") or f"HTTP {last_sc}"
+            return None, f"{msg} | {json.dumps(last_err, ensure_ascii=False)[:400]}"
+        return None, f"HTTP {last_sc}: {str(last_err)[:300]}"
 
     def verify_otp(self, session_token, otp):
         _slp(random.randint(600, 1600))
@@ -302,31 +472,65 @@ class MiniPixClient:
             "phone_number":  self.phone,
             "session_token": session_token,
         }
-        hdrs = {
-            "content-type":        "application/json; charset=utf-8",
-            "x-device-id":         self.device_id,
-            "x-minipix-integrity": self._integrity_stub(),
-        }
-        sc, d = self._req(
-            "POST", "/login/verify-otp",
-            headers=hdrs,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        if sc == 403 and isinstance(d, dict) and d.get("code") == "DEVICE_INTEGRITY_REQUIRED":
-            hdrs["x-minipix-integrity-error"] = "ERR_8000"
-            _slp(random.randint(200, 500))
+        last_err = None
+        last_sc = 0
+        raw_resp = None
+
+        for idx, (label, hdrs) in enumerate(self._login_header_strategies(include_integrity=True), 1):
+            if self.verbose:
+                _p(f"\n▶️  [ATTEMPT {idx}/7] verify-otp strategy → {label}")
+                merged = dict(self.session.headers)
+                merged.update(hdrs)
+                _p(f"   headers = {json.dumps(merged, indent=2, ensure_ascii=False)}")
+            _slp(random.randint(200, 600))
+
             sc, d = self._req(
                 "POST", "/login/verify-otp",
                 headers=hdrs,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             )
+            last_sc = sc
+            last_err = d
+            raw_resp = d
 
-        if not (sc == 200 and isinstance(d, dict) and d.get("access_token")):
+            if sc == 403 and isinstance(d, dict) and d.get("code") == "DEVICE_INTEGRITY_REQUIRED":
+                if self.verbose:
+                    _p(f"\n🔁 [FALLBACK] 403 DEVICE_INTEGRITY_REQUIRED → adding ERR_8000, retrying same strategy once")
+                hdrs_retry = dict(hdrs)
+                hdrs_retry["x-minipix-integrity-error"] = "ERR_8000"
+                _slp(random.randint(200, 500))
+                sc, d = self._req(
+                    "POST", "/login/verify-otp",
+                    headers=hdrs_retry,
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                )
+                last_sc = sc
+                last_err = d
+                raw_resp = d
+
+            if sc == 200 and isinstance(d, dict) and d.get("access_token"):
+                if self.verbose:
+                    _p(f"\n✅ [VERIFY-OTP OK] Strategy '{label}' WORKED on attempt {idx}!")
+                break
+            raw_resp = d
+            if sc in (400, 422):
+                if self.verbose and isinstance(d, dict):
+                    code = d.get("code") or d.get("message") or ""
+                    if "invalid" in str(code).lower() or "otp" in str(code).lower():
+                        _p(f"   ⏹️  Stopping retries — OTP wrong (400 client error)")
+                        break
+            if sc == 401:
+                if self.verbose:
+                    _p(f"   ⏹️  Stopping retries — 401 = session_token invalid/expired")
+                break
+        else:
+            # For loop exhausted without break = no access_token found
             msg = None
-            if isinstance(d, dict):
-                msg = d.get("message") or d.get("error")
-            return False, msg or f"HTTP {sc}: {str(d)[:300]}", None
+            if isinstance(last_err, dict):
+                msg = last_err.get("message") or last_err.get("error")
+            return False, msg or f"HTTP {last_sc}: {str(last_err)[:300]}", raw_resp
 
+        d = raw_resp
         self.access_token  = d["access_token"]
         self.refresh_token = d.get("refresh_token")
         self.quiz_tokens   = (d.get("quiz_tokens")
@@ -338,8 +542,13 @@ class MiniPixClient:
         jwt = decode_jwt_payload(self.access_token)
         if isinstance(jwt, dict):
             if jwt.get("nonce"):
+                old_dev = self.device_id
                 self.device_id     = str(jwt["nonce"])
                 self.device_frozen = True
+                if self.verbose:
+                    _p(f"\n🔒 [JWT BIND] nonce={jwt['nonce']} → device_id FROZEN")
+                    _p(f"   old: {old_dev}")
+                    _p(f"   new: {self.device_id}")
             if not self.user_id:
                 self.user_id = (jwt.get("id") or jwt.get("userId") or jwt.get("user_id")
                                 or jwt.get("_id") or jwt.get("uid") or jwt.get("sub"))
@@ -350,6 +559,11 @@ class MiniPixClient:
                 self.phone = jwt.get("mobile") or jwt.get("phone")
 
         self.session.headers["authorization"] = f"Bearer {self.access_token}"
+        if self.verbose:
+            _p(f"\n✅ [LOGIN OK] access_token received")
+            _p(f"   user_id    = {self.user_id}")
+            _p(f"   profile_id = {self.profile_id}")
+            _p(f"   Bearer prefix set on session")
 
         try:
             _slp(300)
@@ -433,6 +647,94 @@ class MiniPixClient:
             if raw_safe:
                 out["login_response_extra"] = raw_safe
         return out
+
+# ───────────────────────── LOCAL CLI TEST MODE ────────────
+def _input(prompt: str = "") -> str:
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        _p()
+        _p("\n❌ Cancelled by user.")
+        sys.exit(1)
+
+def run_cli_mode():
+    _print_section("MiniPix TOKEN EXTRACTOR — LOCAL CLI TEST MODE")
+    _p("Telegram bot ki zarurat nahi. Direct terminal se login karo.")
+    _p(f"API_BASE = {API_BASE}")
+    _p("Har request ka poora dump (req/resp + 403 + integrity) dikhega.\n")
+
+    use_curl = globals().get("_default_use_curl")
+    client = MiniPixClient(verbose=True, use_curl_cffi=use_curl)
+
+    _print_section("STEP 1 — Phone Number")
+    _p("Phone number daalein (10-digit India ya +91...):")
+    while True:
+        raw = _input("> ").strip()
+        phone = normalize_phone(raw)
+        if phone:
+            break
+        _p("❌ Invalid number. Phir se daalein (e.g. 9876543210 ya +919876543210):")
+
+    _print_section("STEP 2 — Generate OTP")
+    _p(f"📡 Sending OTP request to {phone} ...")
+    session_tok, err = client.generate_otp(phone)
+    if session_tok is None:
+        _p("\n❌❌❌ OTP GENERATE FAILED ❌❌❌")
+        _p(f"Error: {err or 'Unknown'}")
+        _p("\n💡 Agar 403 / DEVICE_INTEGRITY_REQUIRED aa raha hai:")
+        _p("   → Server real Play Integrity / SafetyNet check kar raha hai.")
+        _p("   → Stubbed integrity header (x-minipix-integrity) fail ho raha.")
+        _p("   → Iska matlab actual Android app + signed APK + Play Integrity chahiye.")
+        _p("   → Capture me actual integrity token dekho aur reproduce karo.")
+        sys.exit(4)
+
+    _p(f"\n✅ OTP SENT! session_token = {str(session_tok)[:60]}…")
+    _p(f"   Registered mobile `{phone}` par 6-digit OTP aayega.")
+
+    _print_section("STEP 3 — Verify OTP")
+    for attempt in range(1, 4):
+        _p(f"\nEnter 6-digit OTP (attempt {attempt}/3):")
+        otp_raw = _input("> ").strip()
+        otp = "".join(ch for ch in otp_raw if ch.isdigit())
+        if len(otp) < 4:
+            _p("❌ OTP kam hai (4+ digits chahiye). Phir se try karein.")
+            continue
+
+        ok, err, raw_resp = client.verify_otp(session_tok, otp)
+        if ok:
+            _print_section("✅ LOGIN SUCCESS — TOKENS EXTRACTED")
+            dump = client.build_json_dump(raw_verify_resp=raw_resp)
+
+            fname_base = "".join(ch for ch in (phone or "local") if ch.isalnum())
+            fname = f"minipix_tokens_{fname_base}.json"
+            out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(dump, f, indent=2, ensure_ascii=False)
+
+            _p(f"📁 JSON saved  : {out_path}")
+            _p(f"📱 Phone       : {dump['phone']}")
+            _p(f"🪪 user_id     : {dump['user_id'] or '?'}")
+            _p(f"🧭 profile_id  : {dump['profile_id'] or '?'}")
+            _p(f"📱 device_id   : {dump['device_id']}")
+            _p(f"🔗 nonce_bind  : {'✅ YES (frozen)' if dump['device_bound_via_nonce'] else '❌ No'}")
+            _p(f"🔐 Access Tkn  : {str(dump['tokens']['access_token'])[:60]}…")
+            _p(f"🔄 Refresh     : {'✅ present' if dump['tokens']['refresh_token'] else '—'}")
+            qt = dump['tokens']['quiz_tokens']
+            _p(f"🧠 Quiz Tkns   : {len(qt) if isinstance(qt, list) else ('✅' if qt else '—')}")
+            _p()
+            _p("Full JSON file upar di gayi path par hai.")
+            return
+
+        _p(f"\n❌ OTP VERIFY FAILED (attempt {attempt}/3):")
+        _p(f"   Error: {err or 'Unknown'}")
+        if attempt == 3:
+            _p("\n❌ 3 attempts fail ho gaye. Session khatam.")
+            _p("\n💡 Troubleshooting:")
+            _p("   • 403 DEVICE_INTEGRITY_REQUIRED → Real Play Integrity chahiye")
+            _p("   • 400 Invalid OTP → OTP galat hai, naya OTP generate karo")
+            _p("   • 429 Too Many → Rate limit, 1-2 min wait karo")
+            sys.exit(5)
+        _p("   Naya OTP daalein ya CTRL+C se exit karo.")
 
 # ───────────────────────── TELEGRAM BOT HANDLERS ──────────
 def _keyboard_cancel():
@@ -667,13 +969,106 @@ def build_application(token: str):
     return app
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="MiniPix Token Extractor — Telegram Bot + Local CLI Tester",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Quick ping test (no input needed — check 403/WAF):
+  python token_bot.py --test-request
+
+  # Full CLI interactive login (OTP + extract token JSON):
+  python token_bot.py --local
+
+  # Force-enable curl_cffi JA3 bypass (install first: pip install curl_cffi):
+  python token_bot.py --local --curl
+
+  # Force-disable curl_cffi (use plain requests):
+  python token_bot.py --test-request --no-curl
+
+  # Telegram Bot mode:
+  set TELEGRAM_BOT_TOKEN=xxx
+  python token_bot.py
+""",
+    )
+    parser.add_argument(
+        "--local", "--cli", action="store_true", dest="local_mode",
+        help="Run in LOCAL CLI TEST MODE (no Telegram bot — verbose 403/integrity debug)",
+    )
+    parser.add_argument(
+        "--test-request", action="store_true", dest="test_ping",
+        help="Just ping API_BASE with a simple test request & exit (check 403/WAF)",
+    )
+    curl_group = parser.add_mutually_exclusive_group()
+    curl_group.add_argument(
+        "--curl", "--curl-cffi", action="store_true", dest="force_curl",
+        help="Force curl_cffi HTTP backend (JA3 TLS fingerprint bypass — needs: pip install curl_cffi)",
+    )
+    curl_group.add_argument(
+        "--no-curl", action="store_true", dest="no_curl",
+        help="Force plain python-requests backend (disable curl_cffi even if installed)",
+    )
+    args = parser.parse_args()
+
+    use_curl = None
+    if args.force_curl:
+        use_curl = True
+        if not HAS_CURL_CFFI:
+            _p("❌ --curl flag given but curl_cffi is NOT installed.")
+            _p("   Install: pip install curl_cffi")
+            _p("   (curl_cffi mimics Chrome/Android TLS JA3 signature → WAF blocks ko bypass karta hai)")
+            sys.exit(10)
+    if args.no_curl:
+        use_curl = False
+
+    if args.test_ping:
+        _print_section("API PING TEST (no auth)")
+        c = MiniPixClient(verbose=True, use_curl_cffi=use_curl)
+        _p(f"Testing GET /users/me (expected 401)\n")
+        sc, d = c._req("GET", "/users/me")
+        _p(f"\nFinal status = {sc}")
+        if sc == 0:
+            _p(f"Network error / connection failed: {d}")
+        elif sc == 401:
+            _p("✅ Network OK — 401 = expected (no token)")
+        elif sc == 403:
+            _p("⚠️  403 — WAF: Try: 1) India VPN, 2) pip install curl_cffi then --curl")
+        elif sc == 200:
+            _p("✅ 200 — unusual without token — check response")
+        else:
+            _p(f"Got status {sc} — see response above")
+        sys.exit(0)
+
+    if args.local_mode:
+        try:
+            # Pass through curl flag
+            import __main__
+            globals()["_cli_use_curl"] = use_curl
+            run_cli_mode.__globals__["_default_use_curl"] = use_curl
+            run_cli_mode()
+        except KeyboardInterrupt:
+            _p("\n\n❌ Interrupted. Bye!")
+        return
+
     if not BOT_TOKEN:
         sys.stdout.write(
-            "❌ TELEGRAM_BOT_TOKEN env var nahi mila.\n"
-            "   Set karein & run:\n"
-            "     Windows: set TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
-            "     Linux:   export TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
-            "     python token_bot.py\n"
+            "\n"
+            "═══════════════════════════════════════════════════════════\n"
+            "  MiniPix Token Extractor — Usage Options:\n"
+            "\n"
+            "  OPTION 1 — Local CLI Test (NO TELEGRAM BOT NEEDED)\n"
+            "  Direct terminal me OTP login test karo, 403/integrity debug:\n"
+            "    python token_bot.py --local\n"
+            "\n"
+            "  OPTION 2 — Telegram Bot Mode\n"
+            "  TELEGRAM_BOT_TOKEN set karein phir run karein:\n"
+            "    Windows: set TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
+            "    Linux:   export TELEGRAM_BOT_TOKEN=123456789:ABCxyz...\n"
+            "    python token_bot.py\n"
+            "\n"
+            "  BONUS — API Ping test (quick connectivity + 403 check):\n"
+            "    python token_bot.py --test-request\n"
+            "═══════════════════════════════════════════════════════════\n"
         )
         sys.exit(2)
 
